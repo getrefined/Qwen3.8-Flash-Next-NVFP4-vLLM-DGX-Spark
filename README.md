@@ -91,6 +91,21 @@ bs1 / 81.2 aggregate @ 8 — the vLLM path above is ~40–55% faster across the 
 which we attribute to expert parallelism plus vLLM's MTP-in-CUDA-graphs maturity.
 Numbers are day-1 kernels; no autotuning beyond the image defaults.
 
+
+**Warmed steady-state (measured with [sparkDash](https://github.com/MiaAI-Lab/sparkDash), vLLM Prometheus counter sampling):**
+
+| Streams | Aggregate    | Per-stream | TTFT  |
+| ------- | ------------ | ---------- | ----- |
+| 1       | 63 tok/s     | 63 tok/s   | 221ms |
+| 2       | 80 tok/s     | 47 tok/s   | 368ms |
+| 4       | 130 tok/s    | 37 tok/s   | 552ms |
+| 8       | **203 tok/s**| 29 tok/s   | 686ms |
+
+Two effects versus the fresh-boot table above: MTP acceptance improves as the server
+warms under traffic (bs1 55.8 → 63), and counter-window sampling captures steady-state
+decode without ramp-up/tail, so concurrency aggregates read higher (126 → 203 @ ×8).
+Both views are honest — quote the one that matches your workload.
+
 ## Gotchas that cost us time
 
 - **Multi-pair fleets: pin NCCL to the pair's own HCA only.** If your Sparks have a second
