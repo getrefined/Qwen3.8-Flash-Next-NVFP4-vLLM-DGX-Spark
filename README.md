@@ -62,9 +62,34 @@ that's the shard-copy doing real work, not a hang). Then warmup + graph capture,
 
 ## Benchmark
 
-<!-- TODO: paste bench table (bs1 per-content, conc4, conc8) once final run completes.
-     SGLang reference on identical hardware/checkpoint (graphs+MTP4): 39.0 tok/s bs1
-     greedy median, 81.2 tok/s aggregate @ 8 streams. -->
+OpenAI streaming chat-completions, temp 0, greedy median of 2 reps per probe;
+TTFT to first content/reasoning delta, decode = (tokens−1)/(end−first_token).
+Config as in the launcher: TP2 + EP, MTP3, FULL_DECODE_ONLY CUDA graphs, seqs 8.
+
+**Batch-1 (single stream):**
+
+| Content    | Tokens | TTFT   | Decode tok/s |
+| ---------- | ------ | ------ | ------------ |
+| code       | 545    | 0.26s  | **55.8**     |
+| reasoning  | 575    | 0.28s  | 56.0         |
+| math       | 158    | 0.28s  | 55.6         |
+| C#         | 1200   | 0.27s  | 44.4         |
+| prose      | 718    | 0.31s  | 36.4         |
+
+**Greedy median (code+reasoning+C#): 55.8 tok/s.** MTP draft acceptance ~0.50/token.
+
+**Concurrency:**
+
+| Streams | Per-stream median | Aggregate      | TTFT  |
+| ------- | ----------------- | -------------- | ----- |
+| 4       | 40.7 tok/s        | 75.8 tok/s     | 1.04s |
+| 8       | 31.5 tok/s        | **126.1 tok/s**| 2.75s |
+
+For reference, on the **same two Sparks and same checkpoint**, our best SGLang config
+(day-0 image + SM121 QSA guard patch, NEXTN MTP4, CUDA graphs) measures 39.0 tok/s
+bs1 / 81.2 aggregate @ 8 — the vLLM path above is ~40–55% faster across the board,
+which we attribute to expert parallelism plus vLLM's MTP-in-CUDA-graphs maturity.
+Numbers are day-1 kernels; no autotuning beyond the image defaults.
 
 ## Gotchas that cost us time
 
