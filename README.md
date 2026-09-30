@@ -8,6 +8,15 @@ same checkpoint, same hardware class, different engine. The launcher derives fro
 foogitiff's dual-Spark FP8 config (NVIDIA forum, Qwen3.8-Flash-Next thread, post 97),
 adapted for the NVFP4 checkpoint.
 
+> **Update 2026-09-30 — FP8-dense build, +13.5% decode, same quality.** The NVFP4 checkpoint
+> quantizes only the routed experts; attention, linear attention and the shared expert stay BF16,
+> and those dense layers are most of the bytes a decode step reads. `make-fp8-dense.py` converts
+> just those projections to FP8 (per-channel weights, dynamic per-token activations, no calibration)
+> in under a minute and leaves everything else bit-for-bit. On the same two Sparks: **56.9 → 64.6
+> tok/s single stream, +15% at 172K context, HumanEval-CS 0.854 → 0.848 (a tie)**. It also runs on
+> current vLLM nightlies **without the PLE patch** (fixed upstream). See
+> [FP8-dense build](#fp8-dense-build-2026-09-30).
+
 ## TL;DR
 
 1. **The official vLLM image runs on GB10** — it is multi-arch (aarch64) and registers
@@ -26,6 +35,10 @@ adapted for the NVFP4 checkpoint.
    overlay**, no image rebuild.
 4. NVFP4 expert kernels, the QSA path, and **full prefill + decode CUDA graph capture**
    all work on SM121 out of the box once loading succeeds.
+5. **2026-09-30:** on a vLLM nightly from 2026-09-03 or later the patch is unnecessary
+   ([vllm#54882](https://github.com/vllm-project/vllm/pull/54882) fixed FP8-PLE loading in mixed
+   ModelOpt checkpoints) — run the launcher with `NIGHTLY=1`. Converting the BF16 dense layers to
+   FP8 (`make-fp8-dense.py`) is a free **+13.5% bs1 / +22% at 8 streams**.
 
 ## Hardware
 
@@ -50,6 +63,34 @@ sync; echo 3 | sudo tee /proc/sys/vm/drop_caches   # unified memory: mandatory b
 Load is ~6–7 min (206 shards; the last ~30 are the FP8 PLE shards and run slower —
 that's the shard-copy doing real work, not a hang). Then warmup + graph capture, then
 `/health` goes 200.
+
+### On a current vLLM nightly (no patch)
+
+```bash
+# both nodes — pin a dated nightly tag for reproducible numbers:
+docker pull vllm/vllm-openai:nightly-<sha>
+NIGHTLY=1 IMAGE=vllm/vllm-openai:nightly-<sha> ./launch-vllm-fn.sh 1   # worker
+NIGHTLY=1 IMAGE=vllm/vllm-openai:nightly-<sha> ./launch-vllm-fn.sh 0   # head
+```
+
+`NIGHTLY=1` drops the patch overlay and adds `--engram-config.cpu_offload false` (see gotchas).
+
+### FP8-dense build
+
+```bash
+# on each node (deterministic, byte-identical output; ~1 min, a few GB of RAM):
+docker run --rm --user $(id -u):$(id -g) -v $HOME:/h -e HOME=/tmp --entrypoint python3 \
+  vllm/vllm-openai:nightly-<sha> /h/make-fp8-dense.py \
+  /h/.cache/huggingface/hub/models--RadixArk--Qwen3.8-Flash-Next-NVFP4/snapshots/<rev> \
+  /h/models/qwen38-fn-nvfp4-fp8dense
+
+NIGHTLY=1 IMAGE=... MODEL=/models/qwen38-fn-nvfp4-fp8dense ./launch-vllm-fn.sh 1   # worker
+NIGHTLY=1 IMAGE=... MODEL=/models/qwen38-fn-nvfp4-fp8dense ./launch-vllm-fn.sh 0   # head
+```
+
+Only the four `model-bf16-*` shards are rewritten (~5.8 GB BF16 → ~2.9 GB FP8); every other file
+is hardlinked, so the output costs ~3 GB of disk. The launcher mounts `~/models` read-only at
+`/models`.
 
 ## Config highlights (see launcher for the full set)
 
@@ -106,6 +147,49 @@ warms under traffic (bs1 55.8 → 63), and counter-window sampling captures stea
 decode without ramp-up/tail, so concurrency aggregates read higher (126 → 203 @ ×8).
 Both views are honest — quote the one that matches your workload.
 
+## FP8-dense build (2026-09-30)
+
+`RadixArk/Qwen3.8-Flash-Next-NVFP4` keeps 300 dense projections in BF16: `self_attn.{q,k,v,o}_proj`
+(12 full-attention layers), `linear_attn.{in_proj_qkv,in_proj_z,out_proj}` (36 Gated-DeltaNet
+layers) and `mlp.shared_expert.{gate,up,down}_proj` (48 layers). With only 10 of 512 experts
+active, those BF16 weights are most of what each decode step streams from LPDDR5x.
+`make-fp8-dense.py` rewrites them as ModelOpt `FP8_PER_CHANNEL_PER_TOKEN` inside a
+`MIXED_PRECISION` config:
+
+| Component | RadixArk as shipped | FP8-dense build |
+| --- | --- | --- |
+| Routed experts | NVFP4 W4A4 | NVFP4 W4A4 (untouched; FlashInfer CUTLASS native FP4) |
+| Attention / linear attention / shared expert | BF16 (5.82 GB) | **FP8 E4M3, per-channel scale** (2.91 GB), `CutlassFP8ScaledMMLinearKernel` |
+| PLE n-gram table | FP8 | FP8 (untouched) |
+| `in_proj_a/b`, indexer, router, norms, HC, embed, `lm_head`, MTP, vision | BF16 | BF16 (untouched) |
+
+Activations are quantized dynamically per token, so there is no calibration pass. The MTP head is
+left alone on purpose: draft acceptance is unchanged (mean accept length 2.89 → 2.91).
+
+**Same two Sparks, same nightly (`nightly-ac68c308`), same flags** (`NIGHTLY=1`, seqs 8, GMU 0.80,
+`AUTOTUNE=0`), clocks at boost (~2.49 GHz), 2026-09-30. Same `bench.py` probes as above, plus a
+long-context probe (thinking off, 400-token answer):
+
+| | RadixArk as shipped | FP8-dense build | Δ |
+| --- | --- | --- | --- |
+| bs1 greedy median (code+reasoning+C#) | 56.9 tok/s | **64.6 tok/s** | **+13.5%** |
+| prose | 38.3 | 44.2 | +15% |
+| C# | 47.7 | 53.3 | +12% |
+| 4 streams: aggregate / per-stream | 78.0 / 32.3 | 87.8 / 37.1 | +13% / +15% |
+| 8 streams: aggregate / per-stream | 118.3 / 29.9 | **144.7** / 31.1 | +22% / +4% |
+| decode @ 41K / 172K context | 47.2 / 47.3 | 51.0 / **54.2** | +8% / +15% |
+| prefill @ 172K | 4,270 tok/s | 4,264 tok/s | = |
+| KV pool (262K ctx) | 1.98M tokens | 2.06M tokens | +4% |
+| HumanEval-CS pass@1 | 0.854 | 0.848 | tie |
+
+HumanEval-CS is MultiPL-E C#, 158 problems, greedy, thinking on, 8K budget, graded with structural
+equality (so not comparable to the leaderboard, but consistent between the two columns). The two
+runs disagree on 17 problems, 8 one way and 9 the other.
+
+For reference, this recipe as originally published (day-0 image + patch) re-measures at
+**59.1 tok/s bs1 / 67.5 @4 / 125.0 @8** on the same day. The nightly trades a few percent of bs1
+decode for **~35–40% faster prefill** (3,155 → 4,270 tok/s at 172K).
+
 ## Gotchas that cost us time
 
 - **Multi-pair fleets: pin NCCL to the pair's own HCA only.** If your Sparks have a second
@@ -118,6 +202,17 @@ Both views are honest — quote the one that matches your workload.
   transformers docstring lint, not failures.
 - Patch placement matters: the resolver's *first* gate is the `isinstance(quant_config,
   Fp8Config)` check — an env-gated early return must go **above** it (ask us how we know).
+- **Current vLLM: set PLE offload explicitly.** Nightlies no longer read `VLLM_PLE_CPU_OFFLOAD`
+  (it logs "Unknown vLLM environment variable") and `EngramConfig.cpu_offload` now defaults to
+  `true`. On a Spark host and GPU memory are the same LPDDR, so offload buys nothing and the pinned
+  table comes out of the KV budget: **1.98M → 1.41M tokens**. Use `--engram-config.cpu_offload false`
+  (`NIGHTLY=1` does this).
+- **FlashInfer autotune can deadlock the two ranks.** After switching between checkpoints, the worker
+  missed the autotune config cache and sat in a `Building JIT module trtllm_utils` step with an idle
+  CPU, while the head hit the cache and waited. Twice in a row. `AUTOTUNE=0`
+  (`--no-enable-flashinfer-autotune`) gets past it. The FP8-dense numbers above use it on both sides.
+- **Hardlinks and Docker bind mounts:** `os.link` fails across two separate `-v` mounts even on the
+  same filesystem. Mount one common parent (`-v $HOME:/h`) when running `make-fp8-dense.py`.
 
 ## Credits
 
@@ -125,3 +220,4 @@ Both views are honest — quote the one that matches your workload.
 - **foogitiff** — first dual-Spark vLLM bring-up (FP8 checkpoint) whose launcher this derives from.
 - **RadixArk** — the NVFP4 checkpoint whose PLE layout turns out to match vLLM's own FP8-PLE method exactly.
 - vLLM / Qwen teams for genuine day-0 multi-arch images.
+- **orcarouter** — their [FP8-attention build](https://huggingface.co/orcarouter/Qwen3.8-Flash-Next-Uncensored-NVFP4) of Flash-Next (and a PRO 6000 user's note about how fast it decodes) is what pointed us at the BF16 dense layers.
